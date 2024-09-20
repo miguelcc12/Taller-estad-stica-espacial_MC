@@ -1,0 +1,404 @@
+---
+title: "Taller Espacial de Amenidades de Salud en parroquias de Ecuador"
+author: "Miguel Coral"
+date: "`r Sys.Date()`"
+format: docx
+editor: visual
+---
+
+## Parte 1: Identificación y Reflexión sobre las Amenidades de Salud
+
+#### Información de Hospitales en Pichincha
+
+```{r, echo=FALSE,message=FALSE}
+#Librerías
+library(osmdata)
+library(sf)
+library(tidyverse)
+library(readxl)
+library(spdep)
+library(lattice) 
+library(httr2) 
+
+# zona de interes: Latacunga
+ciudad <- getbb("Quito", "Ecuador")
+query <- opq(ciudad) %>% add_osm_feature(key="amenity", value="hospital") %>% 
+  osmdata_sf()
+# Puntos de hospitales
+hospitales <- query$osm_points
+table(hospitales$amenity)
+
+# capas disponibles en la geodatabase
+geodatabase_path <- "C:/Users/migue/Documents/Cursos/Datos/Data/GEODATABASE_NACIONAL_2021.gdb"
+
+# Sectores censales: "zon_a"
+sec_cens <- st_read(geodatabase_path, layer="zon_a")
+
+# Filtro sectores censales de Pichincha
+sec_cens <- sec_cens %>% filter(substr(zon, 1, 2) == c("17"))
+  
+```
+
+#### Mapa de los hospitales
+
+```{r, echo=FALSE, fig.height=6, fig.dpi=300}
+#Gráfica de hospitales
+ggplot() +
+  geom_sf(data=sec_cens) +
+  geom_sf(data=hospitales)+
+  labs(
+    title = "Fig. Distribución de hospitales en Quito",
+    subtitle = "Fuente:OpenStreetMaps"
+  )+
+  theme_minimal()
+```
+
+#### Cargo información poblacional
+
+```{r, echo=FALSE, message=FALSE}
+# Estructura poblacional
+
+pob <- read_excel(path = "C:/Users/migue/Documents/Cursos/Taller_estadistica_especial/Data/01_2022_CPV_Estructura_poblacional.xlsx", sheet="1.2", range="B13:g1299")
+
+# Renombrar variables
+names(pob) <- c("provincia", "canton", "parroquia", "total_nacional", "hombres", "mujeres")
+
+# trabajo la data de la base 
+pob <- pob %>% 
+  filter(
+    !is.na(provincia), 
+    str_detect(parroquia, "^Total|Nacional", negate=TRUE)
+    )
+
+pob <- pob %>% 
+  mutate_at(
+    vars(provincia, canton, parroquia), 
+    ~str_to_upper(.))
+
+pob_1 <- 
+  pob %>% 
+  filter(provincia == "PICHINCHA",
+         canton == "DISTRITO METROPOLITANO DE QUITO")
+
+#Corrijo nombres
+pob_1 <- 
+  pob_1 %>% 
+  mutate(parroquia = str_replace_all(parroquia,"Á","A"),
+         parroquia = str_replace_all(parroquia,"É","E"),
+  parroquia = str_replace_all(parroquia,"Í","I"), 
+  parroquia = str_replace_all(parroquia,"Ó","O"))
+  
+# Extraigo los códigos de la DPA para cruzar la informacion 
+dpa <- read_excel("C:/Users/migue/Documents/Cursos/Taller_estadistica_especial/Data/Copy of CODIFICACIÓN_2024.xlsx",
+                  sheet = 'CODIGOS',
+                  range = "B2:G1049")
+
+names(dpa) <- c("cod_prov", "nombre_prov","cod_canton","nombre_cant", "cod_parr", "nombre_parr")
+
+dpa <- 
+  dpa %>% 
+  mutate(
+    nombre_cant = ifelse(nombre_cant == "QUITO DISTRITO METROPOLITANO, CABECERA CANTONAL, CAPITAL PROVINCIAL Y DE LA REPUBLICA DEL ECUADOR",
+                       "QUITO",
+                       nombre_cant),
+        nombre_cant = ifelse(nombre_cant == "CHECA (CHILPA)",
+                           "CHECA",
+                       nombre_cant),
+    nombre_cant = ifelse(nombre_cant == "CALDERON (CARAPUNGO)",
+                           "CALDERON",
+                       nombre_cant),
+    nombre_cant = ifelse(nombre_cant == "ATAHUALPA (HABASPAMBA)",
+                           "ATAHUALPA",
+                       nombre_cant)
+      ) %>% 
+    mutate(nombre_parr = str_replace_all(nombre_parr,"Á","A"),
+         nombre_parr = str_replace_all(nombre_parr,"É","E"),
+  nombre_parr = str_replace_all(nombre_parr,"Í","I"), 
+  nombre_parr = str_replace_all(nombre_parr,"Ó","O"))
+
+```
+
+### Parte 2: Unión de polígonos de zonas censales a nivel de parroquias
+
+Realizo la unión de los polígonos de las zonas censales a nivel de parroquia
+
+```{r, echo=FALSE, message=FALSE}
+# Unión de los datos de población con dpa
+pob_1 <- pob_1 %>% 
+  left_join(dpa %>% filter(cod_prov=="17"), by=c("parroquia"="nombre_parr"))
+
+## Unión de los poligonos a nivel de parroquia
+sec_cens <- sec_cens %>% 
+  mutate(DPA_PARROQ=str_sub(zon, 1,6))
+
+parroquias <- sec_cens %>% 
+  group_by(DPA_PARROQ) %>% 
+  summarise(Shape=st_union(Shape))
+
+#Union de la bases 
+parroquias <- parroquias %>% 
+  left_join(pob_1,
+            by = c("DPA_PARROQ" = "cod_parr"))
+
+parroquias$parroquia
+```
+
+#### Mapas de calor
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+parroquias %>% 
+  ggplot() +
+  geom_sf(aes(fill = total_nacional)) +
+  geom_sf(data = hospitales, color = "red", size = 1) + 
+  labs(
+    title = "Figura 2. Densidad poblacional por parroquias, Quito",
+    caption = "Fuente: INEC"
+  ) +
+  scale_fill_viridis_c(option = "plasma") +  
+  theme_minimal() 
+```
+
+### Parte 3: Cálculo del número total de amenidades
+
+```{r, echo=FALSE, message=FALSE}
+# Transformación de las coordenadas de los hospitales al mismo CRS que la
+puntos <- st_transform(x=hospitales, crs=st_crs(parroquias))
+# Unión espacial para contar los hospitales dentro de cada sector censal
+parroquias_hospitales <- st_join(x=puntos, y=parroquias, join=st_within)
+# Conteo del número de hospitales en cada sector censal
+parroquias_hospitales <- parroquias_hospitales %>%  count(DPA_PARROQ, name="hospitales") %>% as_tibble()
+# Unión de los datos parroquias y parroquias_puntos  
+parroquias <- parroquias %>% 
+  left_join(parroquias_hospitales)
+#Reemplazo de na con 0
+parroquias <- parroquias %>% 
+  mutate(hospitales=replace_na(hospitales, 0))
+
+```
+
+#### Parte 4: Cálculo del ratio de amenidades por habitante
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+#Cálculo del índice de amenidades por habitante
+parroquias <- parroquias %>% mutate(indicador=(hospitales/total_nacional)*1000)
+#Gráfica del indicador
+parroquias %>% 
+  ggplot()+
+  geom_sf(aes(fill=indicador))+
+  geom_sf(data=puntos)+
+  scale_fill_viridis_c(option = "plasma") +  
+  labs(title="Figura 3. Indicador de amenidades de salud por cada 1000 habitantes",
+       caption = "Fuente:INEC"
+       )
+
+
+```
+
+### Parte 5: Cálculo del índice de Moran para el Indicador de Amenidades de Salud
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+frec_plot <- parroquias %>% 
+  ggplot(aes(indicador)) +
+   geom_histogram() +
+  labs(title = "Fig 4. Distribución del número de amenidades por habitante",
+       sutitle = "Por zona censal")
+
+frec_plot
+```
+
+El histograma indica que la gran mayoría de las parroquias no cuenta con hospitales.
+
+```{r, echo=FALSE, message=FALSE}
+parroquias_ <- parroquias %>% 
+  st_drop_geometry()
+
+sec_cens <- left_join(sec_cens, parroquias_, by = "DPA_PARROQ")
+sec_cens <- sec_cens %>%
+  mutate(indicador = coalesce(indicador, 0))
+
+```
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+ggplot() +
+  geom_sf(data = sec_cens, aes(fill = indicador)) +
+  scale_fill_viridis_c(option = "plasma") + 
+  labs(title = "Fig 5. Indicador de amenidades de salud por cada 1000 habitantes por sectores")
+```
+
+#### Matriz de Vecindad y Pesos Espaciales
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+vecinos <- poly2nb(sec_cens, queen = TRUE)
+vecinos_pesos <- nb2listw(vecinos,style = "W")
+matriz <- listw2mat(vecinos_pesos)
+
+# Visualización de la Matriz de Pesos Espaciales
+levelplot(t(matriz[1:50,1:50]),
+          scales = list(y = list(at = seq(10, 50, by = 10),
+                                 labels = seq(10, 50, by = 10))),
+          main = "Fig 6. Matriz de Pesos Espaciales Basada en Contigüidad")
+```
+
+Este gráfico muestra cómo están interconectadas las distintas secciones censales en relación con su proximidad espacial. La interpretación se enfoca en identificar cuáles secciones son vecinas (marcadas por las celdas de color) y cómo se distribuyen esas relaciones de vecindad en la matriz.
+
+A continuación, se muestra el índice de Moran para evaluar la autocorrelación espacial.
+
+```{r, echo=FALSE, message=FALSE}
+moran <- moran.test(sec_cens$indicador, listw = vecinos_pesos)
+```
+
+El resultado de la prueba de Moran $I$ es:
+
+```{r}
+moran
+```
+
+Los resultados indican que en Quito, las instalaciones de salud, en particular los hospitales, suelen concentrarse en áreas específicas. Esto podría reflejar una planificación que prioriza la proximidad de estas infraestructuras en ciertas zonas, lo que podría afectar el acceso a los servicios de salud en la región.
+
+#### Análisis de Autocorrelación Espacial con Matriz de distancia Inversa
+
+```{r, echo=FALSE, message=FALSE}
+# Calcular los centroides de las zonas
+centroide <- st_centroid(sec_cens)
+# Calcular las distancias entre los centroides de las zonas vecinas
+dist <- nbdists(vecinos, as.matrix(st_coordinates(centroide)))
+# Calcular los pesos inversos de las distancias
+ids <- map(dist, ~ 1/.x)
+# Crear una matriz de pesos espaciales basada en distancia inversa
+nbw_inv <- nb2listw(vecinos, glist = ids,style = "B",zero.policy = TRUE)
+
+head(nbw_inv)
+
+```
+
+```{r, echo=FALSE, message=FALSE}
+moran_inv <- moran.test(sec_cens$indicador, listw = nbw_inv)
+
+```
+
+El índice con distancias inversas es:
+
+```{r}
+moran_inv
+```
+
+Estos resultados sugieren que la distribución de hospitales en Quito no es fortuita y está determinada por patrones espaciales, lo que podría verse reflejado en la planificación y en la disponibilidad de los servicios de salud.
+
+### Parte 6: Actividad opcional, Análisis de Buffers y Reflexión sobre los Límites de OpenStreetMap
+
+# Quito
+
+```{r, echo=FALSE, message=FALSE}
+#Definir el punto de mi casa
+homme<-tibble(lat=-0.18760499979937972, long=-78.49647873413964) %>% 
+  st_as_sf(coords=c("long","lat"), crs=4326) %>% 
+  st_transform(32717)
+#Intersección
+inter<-st_intersects(homme,sec_cens)
+#Indentificador de poligonos 
+sec_cens[unlist(inter), ] %>% 
+  pull(zon)
+```
+
+```{r,  echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+#Polígono que contiene a la homme
+sec_cens <- sec_cens %>% 
+  mutate(centro=if_else(zon=="170550902",
+                        true="Homme",
+                        false=NA_character_))
+#Mostrar en el mapa mi csa
+mapa_homme<-sec_cens %>% 
+  ggplot()+
+  geom_sf(aes(fill=centro))+
+   labs(title="Figura 7. Homme"
+       )+
+  theme_minimal()
+mapa_homme
+
+# Buffer de 1000 m
+zoom_to <- "170550902"
+homme <- sec_cens %>% filter(zon == zoom_to)
+# Crear un buffer de 1000 m alrededor del polígono de mi casa
+buffer <- st_buffer(homme, dist = 1000)
+class(buffer$Shape)
+
+# Calcular los límites del zoom (bounding box)
+bbox <- st_bbox(buffer)
+
+# Mostrar el mapa con zoom
+mapa_homme <- sec_cens %>% 
+  ggplot() +
+  geom_sf(aes(fill = centro)) +
+  scale_fill_manual(values = c("Homme" = "blue", "gray")) +
+  labs(title = "Figura 7. Homme") +
+  theme_minimal() +
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]), ylim = c(bbox["ymin"], bbox["ymax"]), expand = FALSE)
+
+mapa_homme
+
+```
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+# Calcular el centroide del polígono de mi casa
+# Definir el CRS adecuado para la transformación (por ejemplo, CRS 4326 para long/lat)
+crs_longlat <- 4326
+
+# Convertir el polígono de mi casa a coordenadas geográficas
+homme_zone_geo <- st_transform(homme, crs_longlat)
+
+# Calcular el centroid y transformarlo a coordenadas geográficas
+centroid <- st_centroid(homme_zone_geo)
+
+# Crear un buffer de 1000 m alrededor del centroide en el CRS original
+buffer_centroid <- st_buffer(st_transform(centroid, st_crs(homme)), dist = 1000)
+
+# Calcular los límites del buffer en coordenadas geográficas para el zoom
+bbox <- st_bbox(st_transform(buffer_centroid, crs_longlat))
+
+# Mostrar el buffer del centroide en un mapa con coordenadas geográficas
+ggplot() +
+  geom_sf(data = st_transform(homme_zone_geo, crs_longlat), color = "blue", size = 1) +
+  geom_sf(data = st_transform(buffer_centroid, crs_longlat), fill = "gray", alpha = 0.5) +
+  theme_minimal() +
+  ggtitle("Fig 9. Buffer de 1000 m alrededor del Centroide de mi casa") +
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]), ylim = c(bbox["ymin"], bbox["ymax"]), expand = FALSE)
+
+# Crear buffers de 1000 km alrededor de cada zona censal
+dmq_zonas_buffers <- st_buffer(st_centroid(sec_cens), dist = 1000)
+
+# Identificar zonas con hospitales en el buffer
+zones_with_hospitals <- st_join(puntos, dmq_zonas_buffers, 
+                                join = st_within)
+
+amenidades <- zones_with_hospitals %>%
+  as_tibble() %>%
+  distinct(zon)
+
+sec_cens <- sec_cens %>%
+  mutate(
+    amenidad = case_when(
+      zon %in% amenidades$zon ~ "Hospitales",  
+      TRUE ~ "Ninguna"  
+    )
+  )
+
+sec_cens %>% 
+ggplot() +
+  geom_sf(aes(fill = amenidad)) +
+   scale_fill_manual(values = c("Hospitales" = "green"), na.value = "white") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(title = "Fig 10. Zonas censales con  hospitales", fill = "Amenidad")
+
+# Mostrar el mapa con zoom sobre mi casa
+dmq <- st_transform(sec_cens, crs = 4326)
+buffer_homme_2 <- st_buffer(st_centroid(homme),dist = 1000)
+ggplot(dmq) +
+  geom_sf(aes(fill = amenidad)) +
+    scale_fill_manual(values = c("Hospitales" = "blue", "Ninguna" = "gray")) +
+  geom_sf(data = buffer_homme_2, fill = "white", alpha = 0.5) +
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]), ylim = c(bbox["ymin"], bbox["ymax"]), expand = FALSE) +
+  theme_minimal() +
+  ggtitle("Fig 11.Zoom sobre mi casa")
+
+```
